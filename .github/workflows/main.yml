@@ -1,0 +1,138 @@
+name: OpenFlux Exit Node (Mail.ru)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  openflux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+
+    env:
+      TRANSPORT: mailru
+      DOC_URL: ${{ secrets.MAILRU_DOC_URL }}
+
+    steps:
+      - name: Check secret
+        shell: bash
+        run: |
+          set +x
+
+          if [ -z "${DOC_URL:-}" ]; then
+            echo "ERROR: DOC_URL is not configured (transport: ${TRANSPORT})."
+            exit 1
+          fi
+
+          echo "::add-mask::$DOC_URL"
+          echo "DOC_URL: configured"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set +x
+
+          sudo apt-get update
+          sudo apt-get install -y git golang-go iptables
+
+      - name: Download OpenFlux
+        shell: bash
+        run: |
+          set +x
+
+          git clone --depth 1 https://github.com/p1neappleXpress/OpenFlux.git
+          cd OpenFlux
+
+          echo "OpenFlux commit:"
+          git rev-parse --short HEAD
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          # 'stable', а не точная версия: upstream OpenFlux клонируется на лету, и его
+          # go.mod требует Go новее зашитого. Пин 1.26.4 перестал работать с выходом
+          # релиза 0.5.1, где в go.mod стало `go 1.26.6` — сборка падала кодом 1.
+          # Более новый тулчейн собирает и более старый go.mod, поэтому 'stable'
+          # переживает и это повышение, и следующие.
+          go-version: 'stable'
+          cache: false
+
+      - name: Verify Go
+        shell: bash
+        run: |
+          set +x
+          go version
+
+      - name: Build OpenFlux
+        shell: bash
+        run: |
+          set +x
+
+          cd OpenFlux
+
+          go mod tidy
+          go build -o universal-bypass-tool .
+
+          chmod +x universal-bypass-tool
+
+          echo "Build successful."
+
+      - name: Configure iptables
+        shell: bash
+        run: |
+          set +x
+
+          sudo iptables -C OUTPUT \
+            -p tcp \
+            --tcp-flags RST RST \
+            -j DROP 2>/dev/null || \
+          sudo iptables -A OUTPUT \
+            -p tcp \
+            --tcp-flags RST RST \
+            -j DROP
+
+          echo "RST DROP rule configured."
+
+      - name: Check raw sockets
+        shell: bash
+        run: |
+          set +x
+
+          sudo python3 - <<'PY'
+          import socket
+
+          try:
+              s = socket.socket(
+                  socket.AF_INET,
+                  socket.SOCK_RAW,
+                  socket.IPPROTO_TCP
+              )
+              s.close()
+              print("RAW SOCKET: OK")
+          except Exception as e:
+              print(f"RAW SOCKET: FAILED: {type(e).__name__}: {e}")
+          PY
+
+      - name: Start OpenFlux
+        shell: bash
+        run: |
+          set +x
+
+          cd OpenFlux
+
+          echo "======================================"
+          echo "Starting OpenFlux"
+          echo "Mode: l4 (proxy)"
+          echo "Transport: ${TRANSPORT}"
+          echo "URL: configured (hidden)"
+          echo "Debug: disabled"
+          echo "======================================"
+
+          exec sudo ./universal-bypass-tool \
+            --role=exit \
+            --mode=l4 \
+            --codec=legacy \
+            --transport "$TRANSPORT" \
+            --url "$DOC_URL"
